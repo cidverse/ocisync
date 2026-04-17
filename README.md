@@ -10,10 +10,14 @@
 - Copies tags to the target registry only when missing by default
 - Supports credentials from inline `token`, `token-env`, `token-command` or fallback to `.config/containers/auth.json`
 
+## Installation
+
+...
+
 ## Usage
 
 ```bash
-ocisync ocisync.example.yaml
+ocisync ocisync.yaml
 ```
 
 Add this at the top of your config for editor validation:
@@ -22,7 +26,7 @@ Add this at the top of your config for editor validation:
 # yaml-language-server: $schema=https://raw.githubusercontent.com/cidverse/ocisync/main/configschema/v1.json
 ```
 
-## Example config
+## Example Config
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/cidverse/ocisync/main/configschema/v1.json
@@ -36,7 +40,7 @@ registries:
     type: helm-repo
     url: https://charts.partner.example.com
 
-  internal-prod:
+  internal-mirror:
     type: oci
     registry: registry.internal.example.com
     token-env: TARGET_REGISTRY_TOKEN
@@ -44,20 +48,20 @@ registries:
 images:
   vendor-controller:
     source-registry: vendor-ghcr
-    target-registry: internal-prod
+    target-registry: internal-mirror
     source-repository: vendor/controller
     regex: '^v?1\..*'
     semver:
-      constraint: '>= 1.5.0, < 2.0.0'
+      constraint: ">= 1.5.0, < 2.0.0"
 
   platform-chart:
     source-type: helm-repo
     source-registry: partner-charts
-    target-registry: internal-prod
+    target-registry: internal-mirror
     source-repository: platform
     target-repository: helm/platform
     semver:
-      constraint: '>= 2.3.1'
+      constraint: ">= 2.3.1"
       include-prerelease: false
 ```
 
