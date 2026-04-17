@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/cidverse/ocisync/main/configschema/v1.json",
+  "title": "ocisync config v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "registries",
+    "images"
+  ],
+  "properties": {
+    "registries": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/registryConfig"
+      }
+    },
+    "push-strategy": {
+      "$ref": "#/$defs/pushStrategy"
+    },
+    "images": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/imageConfig"
+      }
+    }
+  },
+  "$defs": {
+    "pushStrategy": {
+      "type": "string",
+      "enum": [
+        "IfNotPresent",
+        "Always"
+      ]
+    },
+    "registryConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "oci",
+            "helm-repo"
+          ]
+        },
+        "registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uri"
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "token-env": {
+          "type": "string",
+          "minLength": 1
+        },
+        "token-command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "insecure": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "helm-repo"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "url"
+            ]
+          },
+          "else": {
+            "required": [
+              "registry"
+            ]
+          }
+        }
+      ],
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "token",
+              "token-env"
+            ]
+          },
+          {
+            "required": [
+              "token",
+              "token-command"
+            ]
+          },
+          {
+            "required": [
+              "token-env",
+              "token-command"
+            ]
+          }
+        ]
+      }
+    },
+    "imageConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source-type": {
+          "type": "string",
+          "enum": [
+            "oci",
+            "helm-repo"
+          ]
+        },
+        "source-registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target-registry": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source-repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target-repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "regex": {
+          "type": "string"
+        },
+        "semver": {
+          "$ref": "#/$defs/semverFilter"
+        },
+        "push-strategy": {
+          "$ref": "#/$defs/pushStrategy"
+        }
+      }
+    },
+    "semverFilter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "constraint": {
+          "type": "string"
+        },
+        "include-prerelease": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
