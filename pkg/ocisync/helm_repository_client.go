@@ -54,9 +54,10 @@ func newHelmRepositoryClient(name string, cfg RegistryConfig) (*helmRepositoryCl
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if transport.TLSClientConfig == nil {
-		transport.TLSClientConfig = &tls.Config{}
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
+	} else {
+		transport.TLSClientConfig.MinVersion = tls.VersionTLS13
 	}
-	transport.TLSClientConfig.MinVersion = tls.VersionTLS13
 	if cfg.Insecure {
 		transport.TLSClientConfig.InsecureSkipVerify = true
 	}
