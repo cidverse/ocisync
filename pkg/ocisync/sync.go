@@ -12,6 +12,7 @@ type SyncRunner struct {
 	logger           *slog.Logger
 	registries       map[string]*registryClient
 	helmRepositories map[string]*helmRepositoryClient
+	patches          map[string]imagePatch
 	checkers         []Evaluator
 }
 
@@ -34,6 +35,8 @@ type SyncCandidate struct {
 	SourceRef        string
 	TargetRef        string
 	Strategy         PushStrategy
+
+	patches *imagePatchSet // patches applied to the image before it is pushed, nil to copy it unchanged
 }
 
 func (c SyncCandidate) targetTag() string {
@@ -64,11 +67,19 @@ func NewSyncer(cfg *Config, logger *slog.Logger) (*SyncRunner, error) {
 		return nil, fmt.Errorf("build helm repository clients: %w", err)
 	}
 
+	patches := make(map[string]imagePatch, len(cfg.Patches))
+	for name, patch := range cfg.Patches {
+		if patch.CACertificates != nil {
+			patches[name] = newCACertificatesPatch(name, patch.CACertificates)
+		}
+	}
+
 	return &SyncRunner{
 		config:           cfg,
 		logger:           logger,
 		registries:       registries,
 		helmRepositories: helmRepositories,
+		patches:          patches,
 		checkers:         nil,
 	}, nil
 }
@@ -105,6 +116,12 @@ func (s *SyncRunner) syncRepository(ctx context.Context, imageName string, cfg I
 		return err
 	}
 
+	patchSet, err := s.patchSet(cfg)
+	if err != nil {
+		stats.Failed++
+		return err
+	}
+
 	tags, err := source.ListTags(ctx, cfg.SourceRepository)
 	if err != nil {
 		stats.Failed++
@@ -136,6 +153,7 @@ func (s *SyncRunner) syncRepository(ctx context.Context, imageName string, cfg I
 		}
 
 		candidate := newCandidate(imageName, cfg, source, target, tag)
+		candidate.patches = patchSet
 		copied, err := s.syncTag(ctx, source, target, candidate)
 		switch {
 		case err != nil:
@@ -172,6 +190,19 @@ func (s *SyncRunner) clients(cfg ImageConfig) (artifactSource, *registryClient, 
 	return nil, nil, fmt.Errorf("source registry %q does not match source-type %q", cfg.SourceRegistry, cfg.SourceType)
 }
 
+// patchSet returns the patches configured for an image, or nil if the image is copied unchanged.
+func (s *SyncRunner) patchSet(cfg ImageConfig) (*imagePatchSet, error) {
+	patches := make([]imagePatch, 0, len(cfg.Patches))
+	for _, name := range cfg.Patches {
+		patch, ok := s.patches[name]
+		if !ok {
+			return nil, fmt.Errorf("patch %q is not defined", name)
+		}
+		patches = append(patches, patch)
+	}
+	return newImagePatchSet(patches, s.logger)
+}
+
 func newCandidate(imageName string, cfg ImageConfig, source artifactSource, target *registryClient, tag string) SyncCandidate {
 	candidate := SyncCandidate{
 		ImageName:        imageName,
@@ -194,6 +225,16 @@ func (s *SyncRunner) syncTag(ctx context.Context, source artifactSource, target 
 		if err != nil {
 			return false, fmt.Errorf("check target tag %s: %w", candidate.TargetRef, err)
 		}
+		if exists && candidate.patches != nil {
+			fingerprint, err := target.PatchFingerprint(ctx, candidate.TargetRepository, candidate.targetTag())
+			if err != nil {
+				return false, fmt.Errorf("read patch fingerprint of %s: %w", candidate.TargetRef, err)
+			}
+			if fingerprint != candidate.patches.fingerprint {
+				s.logger.Info("patches changed, re-syncing existing artifact", "image", candidate.ImageName, "targetRef", candidate.TargetRef, "patches", candidate.patches.names())
+				exists = false
+			}
+		}
 		if exists {
 			s.logger.Info("skipping existing artifact", "image", candidate.ImageName, "targetRef", candidate.TargetRef)
 			return false, nil
@@ -211,6 +252,7 @@ func (s *SyncRunner) syncTag(ctx context.Context, source artifactSource, target 
 		"image", candidate.ImageName,
 		"sourceRef", candidate.SourceRef,
 		"targetRef", candidate.TargetRef,
+		"patches", candidate.patches.names(),
 	)
 	if err := source.CopyTo(ctx, target, candidate); err != nil {
 		return false, err

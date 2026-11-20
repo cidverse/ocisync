@@ -201,10 +201,25 @@ func (r *registryClient) CopyTo(ctx context.Context, target *registryClient, can
 	if err != nil {
 		return fmt.Errorf("build target repository for %s: %w", candidate.TargetRef, err)
 	}
+	if candidate.patches != nil {
+		if err := copyPatchedImage(ctx, sourceRepo, candidate.Tag, targetRepo, candidate.targetTag(), candidate.patches, candidate.SourceRef); err != nil {
+			return fmt.Errorf("copy patched image %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
+		}
+		return nil
+	}
 	if _, err := oras.Copy(ctx, sourceRepo, candidate.Tag, targetRepo, candidate.targetTag(), oras.DefaultCopyOptions); err != nil {
 		return fmt.Errorf("copy %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
 	}
 	return nil
+}
+
+// PatchFingerprint returns the patch fingerprint of repository:tag, or "" if the image was not patched by ocisync.
+func (r *registryClient) PatchFingerprint(ctx context.Context, repository, tag string) (string, error) {
+	repo, err := r.ORASRepository(repository)
+	if err != nil {
+		return "", err
+	}
+	return patchFingerprintOf(ctx, repo, tag)
 }
 
 func (r *registryClient) ORASRepository(repository string) (*orasremote.Repository, error) {

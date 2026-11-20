@@ -1,9 +1,11 @@
 package ocisync
 
 import (
+	"crypto/x509"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -13,6 +15,7 @@ import (
 type Config struct {
 	Registries   map[string]RegistryConfig `yaml:"registries"`
 	Images       map[string]ImageConfig    `yaml:"images"`
+	Patches      map[string]PatchConfig    `yaml:"patches"`
 	PushStrategy PushStrategy              `yaml:"push-strategy"`
 }
 
@@ -40,7 +43,37 @@ type ImageConfig struct {
 	Regex            string        `yaml:"regex"`
 	Semver           *SemverFilter `yaml:"semver"`
 	PushStrategy     PushStrategy  `yaml:"push-strategy"`
+	Patches          []string      `yaml:"patches"`
 }
+
+// PatchConfig defines a modification applied to container images before they are pushed to the target.
+type PatchConfig struct {
+	CACertificates *CACertificatesPatchConfig `yaml:"ca-certificates"`
+}
+
+// CACertificatesPatchConfig adds CA certificates to the system trust stores of an image.
+type CACertificatesPatchConfig struct {
+	// Files are PEM files with one or more certificates, relative to the config file.
+	Files []string `yaml:"files"`
+	// Env sets CA env vars (SSL_CERT_FILE, REQUESTS_CA_BUNDLE, AWS_CA_BUNDLE, PIP_CERT, NODE_EXTRA_CA_CERTS, ...) unless the image already sets them.
+	Env             bool                `yaml:"env"`
+	OnMissingBundle MissingBundleAction `yaml:"on-missing-bundle"`
+	// Base selects the bundle the certificates are added to: the bundle of the image (default) or the CA bundle of
+	// the system running ocisync, which then replaces the bundles of the image.
+	Base CABundleBase `yaml:"base"`
+	// Java selects how Java truststores are handled: replace the truststores in the image (default), write a separate
+	// truststore and select it with JAVA_TOOL_OPTIONS, or leave them alone.
+	Java JavaTruststoreMode `yaml:"java"`
+
+	certificates []*x509.Certificate // loaded from Files by LoadConfig
+	systemBundle []byte              // loaded by LoadConfig for base "system"
+}
+
+type MissingBundleAction string
+
+type CABundleBase string
+
+type JavaTruststoreMode string
 
 type SemverFilter struct {
 	Constraint        string `yaml:"constraint"`
@@ -58,6 +91,17 @@ const (
 
 	PushStrategyIfNotPresent PushStrategy = "IfNotPresent"
 	PushStrategyAlways       PushStrategy = "Always"
+
+	MissingBundleFail   MissingBundleAction = "fail"
+	MissingBundleSkip   MissingBundleAction = "skip"
+	MissingBundleCreate MissingBundleAction = "create"
+
+	CABundleBaseImage  CABundleBase = "image"
+	CABundleBaseSystem CABundleBase = "system"
+
+	JavaTruststoreReplace JavaTruststoreMode = "replace"
+	JavaTruststoreEnv     JavaTruststoreMode = "env"
+	JavaTruststoreNone    JavaTruststoreMode = "none"
 )
 
 func LoadConfig(path string) (*Config, error) {
@@ -76,6 +120,9 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	if err = validateConfig(&cfg); err != nil {
+		return nil, err
+	}
+	if err = loadPatchFiles(&cfg, filepath.Dir(path)); err != nil {
 		return nil, err
 	}
 
@@ -106,6 +153,15 @@ func applyDefaults(cfg *Config) {
 			image.TargetRepository = image.SourceRepository
 		}
 		cfg.Images[name] = image
+	}
+
+	for name, patch := range cfg.Patches {
+		if patch.CACertificates != nil {
+			patch.CACertificates.OnMissingBundle = canonical(patch.CACertificates.OnMissingBundle, normalizeMissingBundleAction)
+			patch.CACertificates.Base = canonical(patch.CACertificates.Base, normalizeCABundleBase)
+			patch.CACertificates.Java = canonical(patch.CACertificates.Java, normalizeJavaTruststoreMode)
+		}
+		cfg.Patches[name] = patch
 	}
 }
 
@@ -251,8 +307,86 @@ func validateConfig(cfg *Config) error {
 		if err := validatePushStrategy(image.PushStrategy, prefix+".push-strategy"); err != nil {
 			return err
 		}
+		seen := map[string]bool{}
+		for i, patchName := range image.Patches {
+			field := fmt.Sprintf("%s.patches[%d]", prefix, i)
+			if _, ok := cfg.Patches[patchName]; !ok {
+				return fmt.Errorf("%s %q is not defined", field, patchName)
+			}
+			if seen[patchName] {
+				return fmt.Errorf("%s %q is listed more than once", field, patchName)
+			}
+			seen[patchName] = true
+		}
+		if len(image.Patches) > 0 && image.SourceType != SourceTypeOCI {
+			return fmt.Errorf("%s.patches can only be used with source-type %q", prefix, SourceTypeOCI)
+		}
 	}
 
+	for name, patch := range cfg.Patches {
+		if err := validatePatchConfig(patch, "patches."+name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validatePatchConfig(patch PatchConfig, field string) error {
+	if patch.CACertificates == nil {
+		return fmt.Errorf("%s must define a patch type (ca-certificates)", field)
+	}
+	ca := patch.CACertificates
+	if len(ca.Files) == 0 {
+		return fmt.Errorf("%s.ca-certificates.files must contain at least one file", field)
+	}
+	for i, file := range ca.Files {
+		if strings.TrimSpace(file) == "" {
+			return fmt.Errorf("%s.ca-certificates.files[%d] must not be empty", field, i)
+		}
+	}
+	if err := validateMissingBundleAction(ca.OnMissingBundle, field+".ca-certificates.on-missing-bundle"); err != nil {
+		return err
+	}
+	if err := validateCABundleBase(ca.Base, field+".ca-certificates.base"); err != nil {
+		return err
+	}
+	return validateJavaTruststoreMode(ca.Java, field+".ca-certificates.java")
+}
+
+// loadPatchFiles reads the files referenced by patches; relative paths are resolved against baseDir.
+func loadPatchFiles(cfg *Config, baseDir string) error {
+	for name, patch := range cfg.Patches {
+		if patch.CACertificates == nil {
+			continue
+		}
+		var certs []*x509.Certificate
+		for i, file := range patch.CACertificates.Files {
+			field := fmt.Sprintf("patches.%s.ca-certificates.files[%d]", name, i)
+			filePath := file
+			if !filepath.IsAbs(filePath) {
+				filePath = filepath.Join(baseDir, filePath)
+			}
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				return fmt.Errorf("%s: %w", field, err)
+			}
+			parsed, err := parseCertificatesPEM(data)
+			if err != nil {
+				return fmt.Errorf("%s %s: %w", field, file, err)
+			}
+			certs = append(certs, parsed...)
+		}
+		patch.CACertificates.certificates = certs
+
+		if patch.CACertificates.Base == CABundleBaseSystem {
+			bundle, err := readSystemCABundle()
+			if err != nil {
+				return fmt.Errorf("patches.%s.ca-certificates.base %q: %w", name, CABundleBaseSystem, err)
+			}
+			patch.CACertificates.systemBundle = bundle
+		}
+	}
 	return nil
 }
 
@@ -334,6 +468,84 @@ func normalizePushStrategy(strategy PushStrategy) PushStrategy {
 		return PushStrategyIfNotPresent
 	case strings.ToLower(string(PushStrategyAlways)):
 		return PushStrategyAlways
+	default:
+		return ""
+	}
+}
+
+func validateMissingBundleAction(action MissingBundleAction, field string) error {
+	if normalizeMissingBundleAction(action) == "" {
+		return fmt.Errorf("%s must be one of %q, %q or %q", field, MissingBundleFail, MissingBundleSkip, MissingBundleCreate)
+	}
+	return nil
+}
+
+func normalizeMissingBundleAction(action MissingBundleAction) MissingBundleAction {
+	switch strings.ToLower(string(action)) {
+	case "", string(MissingBundleFail):
+		return MissingBundleFail
+	case string(MissingBundleSkip):
+		return MissingBundleSkip
+	case string(MissingBundleCreate):
+		return MissingBundleCreate
+	default:
+		return ""
+	}
+}
+
+func validateCABundleBase(base CABundleBase, field string) error {
+	if normalizeCABundleBase(base) == "" {
+		return fmt.Errorf("%s must be one of %q or %q", field, CABundleBaseImage, CABundleBaseSystem)
+	}
+	return nil
+}
+
+func normalizeCABundleBase(base CABundleBase) CABundleBase {
+	switch strings.ToLower(string(base)) {
+	case "", string(CABundleBaseImage):
+		return CABundleBaseImage
+	case string(CABundleBaseSystem):
+		return CABundleBaseSystem
+	default:
+		return ""
+	}
+}
+
+// readSystemCABundle reads the CA bundle of the system running ocisync: $SSL_CERT_FILE if set, otherwise the first
+// well-known bundle location that exists. Symlinks are followed on the host.
+func readSystemCABundle() ([]byte, error) {
+	candidates := caBundlePaths
+	if file := os.Getenv("SSL_CERT_FILE"); file != "" {
+		candidates = []string{file}
+	}
+	for _, candidate := range candidates {
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		if !x509.NewCertPool().AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("system CA bundle %s contains no certificates", candidate)
+		}
+		return data, nil
+	}
+	return nil, fmt.Errorf("no system CA bundle found (checked %s)", strings.Join(candidates, ", "))
+}
+
+func validateJavaTruststoreMode(mode JavaTruststoreMode, field string) error {
+	if normalizeJavaTruststoreMode(mode) == "" {
+		return fmt.Errorf("%s must be one of %q, %q or %q", field, JavaTruststoreReplace, JavaTruststoreEnv, JavaTruststoreNone)
+	}
+	return nil
+}
+
+func normalizeJavaTruststoreMode(mode JavaTruststoreMode) JavaTruststoreMode {
+	switch strings.ToLower(string(mode)) {
+	case "", string(JavaTruststoreReplace):
+		return JavaTruststoreReplace
+	case string(JavaTruststoreEnv):
+		return JavaTruststoreEnv
+	case string(JavaTruststoreNone):
+		return JavaTruststoreNone
 	default:
 		return ""
 	}

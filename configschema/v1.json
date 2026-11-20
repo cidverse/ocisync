@@ -25,6 +25,13 @@
       "additionalProperties": {
         "$ref": "#/$defs/imageConfig"
       }
+    },
+    "patches": {
+      "type": "object",
+      "description": "Named patches that images can reference to modify container images before they are pushed to the target.",
+      "additionalProperties": {
+        "$ref": "#/$defs/patchConfig"
+      }
     }
   },
   "$defs": {
@@ -180,6 +187,15 @@
         },
         "push-strategy": {
           "$ref": "#/$defs/pushStrategy"
+        },
+        "patches": {
+          "type": "array",
+          "description": "Names of patches (from the top-level patches) applied to the image, in order. Only for source-type oci; patched images get new digests.",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     },
@@ -192,6 +208,65 @@
         },
         "include-prerelease": {
           "type": "boolean"
+        }
+      }
+    },
+    "patchConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "ca-certificates": {
+          "$ref": "#/$defs/caCertificatesPatch"
+        }
+      }
+    },
+    "caCertificatesPatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Adds CA certificates to the system CA bundles of the image (Debian/Ubuntu/Alpine, RHEL/Fedora/UBI, SUSE, Arch, ...) and to the anchor directories of the distribution trust tooling.",
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "description": "PEM files with one or more certificates, relative to the config file.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "env": {
+          "type": "boolean",
+          "description": "Set CA environment variables for runtimes with their own CA store, unless the image already sets them: SSL_CERT_FILE, REQUESTS_CA_BUNDLE, AWS_CA_BUNDLE, PIP_CERT, CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE, HEX_CACERTS_PATH (patched bundle), DENO_TLS_CA_STORE=system and NODE_EXTRA_CA_CERTS (only the added certificates)."
+        },
+        "on-missing-bundle": {
+          "type": "string",
+          "enum": [
+            "fail",
+            "skip",
+            "create"
+          ],
+          "description": "What to do if the image contains no CA bundle: fail (default), skip (copy without certificate changes), or create /etc/ssl/certs/ca-certificates.crt with only the configured certificates."
+        },
+        "base": {
+          "type": "string",
+          "enum": [
+            "image",
+            "system"
+          ],
+          "description": "Bundle the certificates are added to: image (default) appends them to the bundles of the image; system replaces the image bundles with the CA bundle of the system running ocisync ($SSL_CERT_FILE or the first well-known bundle path) plus the certificates."
+        },
+        "java": {
+          "type": "string",
+          "enum": [
+            "replace",
+            "env",
+            "none"
+          ],
+          "description": "Java truststores, built (JKS) from the patched CA bundle: replace (default) overwrites every JDK cacerts and distribution java truststore in the image; env writes /etc/ssl/certs/java/ocisync-<patch>.jks and selects it via JAVA_TOOL_OPTIONS; none leaves them alone. Images without a JDK/JRE are not changed."
         }
       }
     }

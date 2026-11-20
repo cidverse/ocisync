@@ -1,6 +1,7 @@
 package ocisync
 
 import (
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,5 +181,205 @@ images:
 	}
 	if got := cfg.Registries["src"].Token; got != "secret" {
 		t.Errorf("token = %q", got)
+	}
+}
+
+func writeTestCertificate(t *testing.T, dir, name string) {
+	t.Helper()
+	cert := newTestCACert(t, "Corp Root CA")
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const patchTestRegistries = `
+registries:
+  src:
+    registry: ghcr.io
+  dst:
+    registry: registry.example.com
+  charts:
+    type: helm-repo
+    url: https://charts.example.com
+`
+
+func TestLoadConfigPatches(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCertificate(t, dir, "corp.pem")
+	path := filepath.Join(dir, "ocisync.yaml")
+	if err := os.WriteFile(path, []byte(patchTestRegistries+`
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [corp.pem]
+      on-missing-bundle: Create
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+    patches: [corp-ca]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := cfg.Patches["corp-ca"].CACertificates
+	if ca.OnMissingBundle != MissingBundleCreate {
+		t.Errorf("on-missing-bundle = %q", ca.OnMissingBundle)
+	}
+	if len(ca.certificates) != 1 || ca.certificates[0].Subject.CommonName != "Corp Root CA" {
+		t.Errorf("certificates = %v", ca.certificates)
+	}
+}
+
+func TestLoadConfigPatchErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{
+			name: "undefined patch",
+			config: `
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+    patches: [missing]
+`,
+			wantErr: `images.app.patches[0] "missing" is not defined`,
+		},
+		{
+			name: "helm source",
+			config: `
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [corp.pem]
+images:
+  chart:
+    source-type: helm-repo
+    source-registry: charts
+    target-registry: dst
+    source-repository: chart
+    patches: [corp-ca]
+`,
+			wantErr: "images.chart.patches can only be used with source-type",
+		},
+		{
+			name: "no files",
+			config: `
+patches:
+  corp-ca:
+    ca-certificates: {}
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+`,
+			wantErr: "patches.corp-ca.ca-certificates.files must contain at least one file",
+		},
+		{
+			name: "invalid on-missing-bundle",
+			config: `
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [corp.pem]
+      on-missing-bundle: ignore
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+`,
+			wantErr: "patches.corp-ca.ca-certificates.on-missing-bundle must be one of",
+		},
+		{
+			name: "invalid java mode",
+			config: `
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [corp.pem]
+      java: keystore
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+`,
+			wantErr: "patches.corp-ca.ca-certificates.java must be one of",
+		},
+		{
+			name: "missing file",
+			config: `
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [does-not-exist.pem]
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+`,
+			wantErr: "patches.corp-ca.ca-certificates.files[0]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeTestCertificate(t, dir, "corp.pem")
+			path := filepath.Join(dir, "ocisync.yaml")
+			if err := os.WriteFile(path, []byte(patchTestRegistries+tt.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("err = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfigSystemBase(t *testing.T) {
+	dir := t.TempDir()
+	writeTestCertificate(t, dir, "corp.pem")
+	writeTestCertificate(t, dir, "system.pem")
+	t.Setenv("SSL_CERT_FILE", filepath.Join(dir, "system.pem"))
+	path := filepath.Join(dir, "ocisync.yaml")
+	if err := os.WriteFile(path, []byte(patchTestRegistries+`
+patches:
+  corp-ca:
+    ca-certificates:
+      files: [corp.pem]
+      base: System
+images:
+  app:
+    source-registry: src
+    target-registry: dst
+    source-repository: org/app
+    patches: [corp-ca]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := cfg.Patches["corp-ca"].CACertificates
+	system, _ := os.ReadFile(filepath.Join(dir, "system.pem"))
+	if ca.Base != CABundleBaseSystem || string(ca.systemBundle) != string(system) {
+		t.Errorf("base = %q, system bundle loaded = %v", ca.Base, len(ca.systemBundle) > 0)
 	}
 }
