@@ -2,7 +2,8 @@ package ocisync
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,11 +15,12 @@ import (
 )
 
 type helmRepositoryClient struct {
-	name    string
-	baseURL *url.URL
-	token   string
-	client  *http.Client
-	index   *helmRepositoryIndex
+	name     string
+	baseURL  *url.URL
+	username string
+	token    string
+	client   *http.Client
+	index    *helmRepositoryIndex
 }
 
 type helmRepositoryIndex struct {
@@ -28,6 +30,7 @@ type helmRepositoryIndex struct {
 type helmRepositoryEntry struct {
 	Version string   `yaml:"version"`
 	URLs    []string `yaml:"urls"`
+	Digest  string   `yaml:"digest"`
 	Removed bool     `yaml:"removed"`
 }
 
@@ -51,23 +54,23 @@ func newHelmRepositoryClient(name string, cfg RegistryConfig) (*helmRepositoryCl
 	if err != nil {
 		return nil, fmt.Errorf("parse helm repository url %q: %w", cfg.URL, err)
 	}
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if transport.TLSClientConfig == nil {
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS13}
-	} else {
-		transport.TLSClientConfig.MinVersion = tls.VersionTLS13
-	}
-	if cfg.Insecure {
-		transport.TLSClientConfig.InsecureSkipVerify = true
+	// relative references (index.yaml, chart urls) must resolve below the repository path, not next to it
+	if !strings.HasSuffix(baseURL.Path, "/") {
+		baseURL.Path += "/"
+		if baseURL.RawPath != "" {
+			baseURL.RawPath += "/"
+		}
 	}
 
+	// http vs. https is determined by the repository url, so insecure only disables certificate verification here
 	return &helmRepositoryClient{
-		name:    name,
-		baseURL: baseURL,
-		token:   cfg.Token,
+		name:     name,
+		baseURL:  baseURL,
+		username: cfg.Username,
+		token:    cfg.Token,
 		client: &http.Client{
-			Transport: transport,
+			Transport: newHTTPTransport(cfg.Insecure),
+			Timeout:   helmRequestTimeout,
 		},
 	}, nil
 }
@@ -112,7 +115,28 @@ func (r *helmRepositoryClient) DownloadChart(ctx context.Context, chartName, ver
 	if err != nil {
 		return nil, err
 	}
-	return r.fetch(ctx, chartURL.String())
+	chartData, err := r.fetch(ctx, chartURL.String())
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyChartDigest(chartData, entry.Digest); err != nil {
+		return nil, fmt.Errorf("chart %s version %s from %s: %w", chartName, version, chartURL.String(), err)
+	}
+	return chartData, nil
+}
+
+// verifyChartDigest checks the chart archive against the sha256 digest from index.yaml. Old indexes may lack the
+// digest, in which case there is nothing to verify against.
+func verifyChartDigest(chartData []byte, expected string) error {
+	expected = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(expected), "sha256:"))
+	if expected == "" {
+		return nil
+	}
+	sum := sha256.Sum256(chartData)
+	if actual := hex.EncodeToString(sum[:]); actual != expected {
+		return fmt.Errorf("digest mismatch: index.yaml has sha256:%s, downloaded archive has sha256:%s", expected, actual)
+	}
+	return nil
 }
 
 func (r *helmRepositoryClient) loadIndex(ctx context.Context) (*helmRepositoryIndex, error) {
@@ -175,8 +199,13 @@ func (r *helmRepositoryClient) fetch(ctx context.Context, rawURL string) ([]byte
 	if err != nil {
 		return nil, err
 	}
-	if r.token != "" {
-		req.Header.Set("Authorization", "Bearer "+r.token)
+	// only send credentials to the repository itself, never to chart urls hosted elsewhere (e.g. release assets)
+	if r.token != "" && sameOrigin(req.URL, r.baseURL) {
+		if r.username != "" {
+			req.SetBasicAuth(r.username, r.token)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+r.token)
+		}
 	}
 
 	resp, err := r.client.Do(req)
@@ -194,4 +223,25 @@ func (r *helmRepositoryClient) fetch(ctx context.Context, rawURL string) ([]byte
 		return nil, err
 	}
 	return data, nil
+}
+
+// Reference returns a human-readable reference for a chart version, used for logging.
+func (r *helmRepositoryClient) Reference(chartName, version string) string {
+	return fmt.Sprintf("%s/%s:%s", r.name, chartName, version)
+}
+
+// CopyTo downloads the chart version from the helm repository and pushes it as an OCI artifact to the target registry.
+func (r *helmRepositoryClient) CopyTo(ctx context.Context, target *registryClient, candidate SyncCandidate) error {
+	chartData, err := r.DownloadChart(ctx, candidate.SourceRepository, candidate.Tag)
+	if err != nil {
+		return fmt.Errorf("download chart %s version %s: %w", candidate.SourceRepository, candidate.Tag, err)
+	}
+	if err := target.PushHelmChart(ctx, candidate.TargetRepository, candidate.targetTag(), chartData); err != nil {
+		return fmt.Errorf("push helm chart %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
+	}
+	return nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
 }

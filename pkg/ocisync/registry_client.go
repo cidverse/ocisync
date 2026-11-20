@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -51,6 +53,8 @@ type registryClient struct {
 	registry   string
 	insecure   bool
 	credential orasauth.CredentialFunc
+	httpClient *http.Client
+	authCache  orasauth.Cache
 }
 
 func newRegistryClients(configs map[string]RegistryConfig) (map[string]*registryClient, error) {
@@ -83,13 +87,23 @@ func newRegistryClient(cfg RegistryConfig) (*registryClient, error) {
 		registry:   registry,
 		insecure:   cfg.Insecure,
 		credential: credentialFunc,
+		// retries transient failures (429, 5xx, network errors) on top of a transport with timeouts
+		httpClient: &http.Client{Transport: orasretry.NewTransport(newHTTPTransport(false))},
+		// shared across all repositories of this registry, so tokens are reused instead of re-authenticating per call
+		authCache: orasauth.NewCache(),
 	}, nil
 }
 
 func newCredentialFunc(cfg RegistryConfig) (orasauth.CredentialFunc, error) {
 	if cfg.Token != "" {
+		// with a username the token is used as password (basic auth / token exchange, e.g. docker hub, harbor, ghcr
+		// personal access tokens), without one it is sent as-is as bearer token to the registry.
+		credential := orasauth.Credential{AccessToken: cfg.Token}
+		if cfg.Username != "" {
+			credential = orasauth.Credential{Username: cfg.Username, Password: cfg.Token}
+		}
 		return func(context.Context, string) (orasauth.Credential, error) {
-			return orasauth.Credential{AccessToken: cfg.Token}, nil
+			return credential, nil
 		}, nil
 	}
 
@@ -172,11 +186,25 @@ func (r *registryClient) TagExists(ctx context.Context, repository, tag string) 
 	return false, err
 }
 
-func (r *registryClient) TagReference(repository, tag string) (string, error) {
-	if strings.TrimSpace(tag) == "" {
-		return "", fmt.Errorf("tag is required")
+// Reference returns the full reference (registry/repository:tag) of a tag.
+func (r *registryClient) Reference(repository, tag string) string {
+	return fmt.Sprintf("%s:%s", r.referencePath(repository), tag)
+}
+
+// CopyTo copies the candidate's tag, including all referenced manifests and blobs, to the target registry.
+func (r *registryClient) CopyTo(ctx context.Context, target *registryClient, candidate SyncCandidate) error {
+	sourceRepo, err := r.ORASRepository(candidate.SourceRepository)
+	if err != nil {
+		return fmt.Errorf("build source repository for %s: %w", candidate.SourceRef, err)
 	}
-	return fmt.Sprintf("%s:%s", r.referencePath(repository), tag), nil
+	targetRepo, err := target.ORASRepository(candidate.TargetRepository)
+	if err != nil {
+		return fmt.Errorf("build target repository for %s: %w", candidate.TargetRef, err)
+	}
+	if _, err := oras.Copy(ctx, sourceRepo, candidate.Tag, targetRepo, candidate.targetTag(), oras.DefaultCopyOptions); err != nil {
+		return fmt.Errorf("copy %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
+	}
+	return nil
 }
 
 func (r *registryClient) ORASRepository(repository string) (*orasremote.Repository, error) {
@@ -189,38 +217,37 @@ func (r *registryClient) ORASRepository(repository string) (*orasremote.Reposito
 	}
 	repo.PlainHTTP = r.insecure
 	repo.Client = &orasauth.Client{
-		Client:     orasretry.DefaultClient,
-		Cache:      orasauth.NewCache(),
+		Client:     r.httpClient,
+		Cache:      r.authCache,
 		Credential: r.credential,
 	}
 	return repo, nil
 }
 
-func (r *registryClient) PushHelmChart(ctx context.Context, repository string, chartData []byte) (string, error) {
-	meta, err := extractHelmChartMetadata(chartData)
+// PushHelmChart packages a chart archive as a Helm OCI artifact and pushes it to repository:tag.
+func (r *registryClient) PushHelmChart(ctx context.Context, repository, tag string, chartData []byte) error {
+	meta, configData, err := extractHelmChartMetadata(chartData)
 	if err != nil {
-		return "", err
+		return err
+	}
+	if expected := helmChartRegistryTag(meta.Version); expected != tag {
+		return fmt.Errorf("chart archive has version %q, which does not match tag %q from the repository index", meta.Version, tag)
 	}
 
-	tag := helmChartRegistryTag(meta.Version)
 	targetRepo, err := r.ORASRepository(repository)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	store := memory.New()
 	chartDescriptor := content.NewDescriptorFromBytes(helmChartLayerMediaType, chartData)
 	if err := store.Push(ctx, chartDescriptor, bytes.NewReader(chartData)); err != nil {
-		return "", fmt.Errorf("push chart layer to memory store: %w", err)
+		return fmt.Errorf("push chart layer to memory store: %w", err)
 	}
 
-	configData, err := json.Marshal(meta)
-	if err != nil {
-		return "", fmt.Errorf("marshal chart metadata: %w", err)
-	}
 	configDescriptor := content.NewDescriptorFromBytes(helmConfigMediaType, configData)
 	if err := store.Push(ctx, configDescriptor, bytes.NewReader(configData)); err != nil {
-		return "", fmt.Errorf("push chart config to memory store: %w", err)
+		return fmt.Errorf("push chart config to memory store: %w", err)
 	}
 
 	manifestDescriptor, err := oras.PackManifest(ctx, store, oras.PackManifestVersion1_1, "", oras.PackManifestOptions{
@@ -229,23 +256,25 @@ func (r *registryClient) PushHelmChart(ctx context.Context, repository string, c
 		ManifestAnnotations: generateHelmOCIAnnotations(meta),
 	})
 	if err != nil {
-		return "", fmt.Errorf("pack helm chart manifest: %w", err)
+		return fmt.Errorf("pack helm chart manifest: %w", err)
 	}
 	if err := store.Tag(ctx, manifestDescriptor, tag); err != nil {
-		return "", fmt.Errorf("tag helm chart manifest: %w", err)
+		return fmt.Errorf("tag helm chart manifest: %w", err)
 	}
 
 	if _, err := oras.Copy(ctx, store, tag, targetRepo, tag, oras.DefaultCopyOptions); err != nil {
-		return "", fmt.Errorf("push helm chart to registry: %w", err)
+		return fmt.Errorf("push helm chart to registry: %w", err)
 	}
 
-	return tag, nil
+	return nil
 }
 
-func extractHelmChartMetadata(chartData []byte) (*helmChartMetadata, error) {
+// extractHelmChartMetadata reads the top-level Chart.yaml from a chart archive. It returns the parsed metadata (used for
+// annotations) and the complete Chart.yaml as JSON, which is used as the OCI config blob, as done by helm push.
+func extractHelmChartMetadata(chartData []byte) (*helmChartMetadata, []byte, error) {
 	gzipReader, err := gzip.NewReader(bytes.NewReader(chartData))
 	if err != nil {
-		return nil, fmt.Errorf("open helm chart archive: %w", err)
+		return nil, nil, fmt.Errorf("open helm chart archive: %w", err)
 	}
 	defer gzipReader.Close()
 
@@ -256,31 +285,98 @@ func extractHelmChartMetadata(chartData []byte) (*helmChartMetadata, error) {
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("read helm chart archive: %w", err)
+			return nil, nil, fmt.Errorf("read helm chart archive: %w", err)
 		}
-		if header.Typeflag != tar.TypeReg {
-			continue
-		}
-		if !strings.HasSuffix(header.Name, "/Chart.yaml") {
+		if header.Typeflag != tar.TypeReg || !isTopLevelChartYAML(header.Name) {
 			continue
 		}
 
 		chartYAML, err := io.ReadAll(tarReader)
 		if err != nil {
-			return nil, fmt.Errorf("read Chart.yaml from archive: %w", err)
+			return nil, nil, fmt.Errorf("read Chart.yaml from archive: %w", err)
 		}
 
 		var meta helmChartMetadata
 		if err := yaml.Unmarshal(chartYAML, &meta); err != nil {
-			return nil, fmt.Errorf("parse Chart.yaml: %w", err)
+			return nil, nil, fmt.Errorf("parse Chart.yaml: %w", err)
 		}
 		if strings.TrimSpace(meta.Name) == "" || strings.TrimSpace(meta.Version) == "" {
-			return nil, fmt.Errorf("chart metadata must contain name and version")
+			return nil, nil, fmt.Errorf("chart metadata must contain name and version")
 		}
-		return &meta, nil
+
+		var root yaml.Node
+		if err := yaml.Unmarshal(chartYAML, &root); err != nil {
+			return nil, nil, fmt.Errorf("parse Chart.yaml: %w", err)
+		}
+		raw, err := yamlNodeToJSONValue(&root)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse Chart.yaml: %w", err)
+		}
+		configData, err := json.Marshal(raw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal chart metadata: %w", err)
+		}
+
+		return &meta, configData, nil
 	}
 
-	return nil, fmt.Errorf("Chart.yaml not found in helm chart archive")
+	return nil, nil, fmt.Errorf("Chart.yaml not found in helm chart archive")
+}
+
+// yamlNodeToJSONValue converts a yaml node into a value for json encoding. Numeric scalars are kept as strings with their
+// original text: helm decodes the config blob into chart.Metadata, which has no numeric fields, and unquoted values such
+// as "appVersion: 1.10" must neither become a json number (breaks helm pull) nor lose their formatting (1.10 -> 1.1).
+func yamlNodeToJSONValue(node *yaml.Node) (any, error) {
+	switch node.Kind {
+	case yaml.DocumentNode:
+		if len(node.Content) == 0 {
+			return nil, nil
+		}
+		return yamlNodeToJSONValue(node.Content[0])
+	case yaml.AliasNode:
+		return yamlNodeToJSONValue(node.Alias)
+	case yaml.MappingNode:
+		out := make(map[string]any, len(node.Content)/2)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			value, err := yamlNodeToJSONValue(node.Content[i+1])
+			if err != nil {
+				return nil, err
+			}
+			out[node.Content[i].Value] = value
+		}
+		return out, nil
+	case yaml.SequenceNode:
+		out := make([]any, 0, len(node.Content))
+		for _, item := range node.Content {
+			value, err := yamlNodeToJSONValue(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, value)
+		}
+		return out, nil
+	case yaml.ScalarNode:
+		switch node.ShortTag() {
+		case "!!null":
+			return nil, nil
+		case "!!bool":
+			var b bool
+			if err := node.Decode(&b); err != nil {
+				return nil, err
+			}
+			return b, nil
+		default:
+			return node.Value, nil
+		}
+	default:
+		return nil, fmt.Errorf("unsupported yaml node kind %d", node.Kind)
+	}
+}
+
+// isTopLevelChartYAML reports whether a tar entry is <chart>/Chart.yaml, excluding subcharts (<chart>/charts/<sub>/Chart.yaml).
+func isTopLevelChartYAML(name string) bool {
+	dir, file := path.Split(strings.TrimPrefix(name, "./"))
+	return file == "Chart.yaml" && dir != "" && strings.Count(dir, "/") == 1
 }
 
 func helmChartRegistryTag(version string) string {

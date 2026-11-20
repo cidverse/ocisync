@@ -9,6 +9,8 @@
 - Supports classic Helm chart repositories as a source
 - Copies tags to the target registry only when missing by default
 - Supports credentials from inline `token`, `token-env`, `token-command` or fallback to `.config/containers/auth.json`
+  - with `username`, the token is used as password (basic auth / token exchange, required by e.g. Docker Hub, Harbor, GHCR with a PAT); without it, the token is sent as bearer token
+- Verifies Helm chart downloads against the `digest` from `index.yaml`
 
 ## Installation
 
@@ -34,6 +36,7 @@ registries:
   vendor-ghcr:
     type: oci
     registry: ghcr.io
+    username: my-user
     token-env: SOURCE_GHCR_TOKEN
 
   partner-charts:

@@ -22,6 +22,7 @@ type RegistryConfig struct {
 	Type         RegistryType `yaml:"type"`
 	Registry     string       `yaml:"registry"`
 	URL          string       `yaml:"url"`
+	Username     string       `yaml:"username"`
 	Token        string       `yaml:"token"`
 	TokenEnv     string       `yaml:"token-env"`
 	TokenCommand string       `yaml:"token-command"`
@@ -82,23 +83,21 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
-	if cfg.PushStrategy == "" {
-		cfg.PushStrategy = PushStrategyIfNotPresent
-	}
+	// enum values are matched case-insensitively; normalize valid values to their canonical form so the rest of the
+	// code can compare against the constants directly. invalid values are kept as-is so validation can report them.
+	cfg.PushStrategy = canonical(cfg.PushStrategy, normalizePushStrategy)
 
 	for name, registry := range cfg.Registries {
-		if registry.Type == "" {
-			registry.Type = RegistryTypeOCI
-		}
+		registry.Type = canonical(registry.Type, normalizeRegistryType)
 		cfg.Registries[name] = registry
 	}
 
 	for name, image := range cfg.Images {
-		if image.SourceType == "" {
-			image.SourceType = SourceTypeOCI
-		}
+		image.SourceType = canonical(image.SourceType, normalizeSourceType)
 		if image.PushStrategy == "" {
 			image.PushStrategy = cfg.PushStrategy
+		} else {
+			image.PushStrategy = canonical(image.PushStrategy, normalizePushStrategy)
 		}
 		if image.SourceRepository == "" {
 			image.SourceRepository = image.TargetRepository
@@ -108,6 +107,14 @@ func applyDefaults(cfg *Config) {
 		}
 		cfg.Images[name] = image
 	}
+}
+
+// canonical returns the normalized form of value, or value unchanged if it is not a recognized value.
+func canonical[T ~string](value T, normalize func(T) T) T {
+	if normalized := normalize(value); normalized != "" {
+		return normalized
+	}
+	return value
 }
 
 func sortedImageNames(images map[string]ImageConfig) []string {
@@ -216,10 +223,10 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("%s.source-repository is required", prefix)
 		}
 		if image.SourceRegistry == "" {
-			return fmt.Errorf("%s.source-registry is required when multiple registries are configured", prefix)
+			return fmt.Errorf("%s.source-registry is required", prefix)
 		}
 		if image.TargetRegistry == "" {
-			return fmt.Errorf("%s.target-registry is required when multiple registries are configured", prefix)
+			return fmt.Errorf("%s.target-registry is required", prefix)
 		}
 		if _, ok := cfg.Registries[image.SourceRegistry]; !ok {
 			return fmt.Errorf("%s.source-registry %q is not defined", prefix, image.SourceRegistry)
@@ -231,7 +238,7 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("%s.target-registry %q must reference an oci registry", prefix, image.TargetRegistry)
 		}
 		sourceRegistry := cfg.Registries[image.SourceRegistry]
-		switch normalizeSourceType(image.SourceType) {
+		switch image.SourceType {
 		case SourceTypeOCI:
 			if sourceRegistry.Type != RegistryTypeOCI {
 				return fmt.Errorf("%s.source-registry %q must reference an oci registry for source-type %q", prefix, image.SourceRegistry, SourceTypeOCI)
@@ -265,6 +272,9 @@ func validateRegistryConfig(registry RegistryConfig, field string) error {
 	}
 	if err := validateCredentialSources(registry, field); err != nil {
 		return err
+	}
+	if registry.Username != "" && registry.Token == "" {
+		return fmt.Errorf("%s.username requires one of token, token-env, or token-command", field)
 	}
 	return nil
 }

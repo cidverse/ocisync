@@ -2,10 +2,9 @@ package ocisync
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-
-	oras "oras.land/oras-go/v2"
 )
 
 type SyncRunner struct {
@@ -44,6 +43,13 @@ func (c SyncCandidate) targetTag() string {
 	return c.Tag
 }
 
+// artifactSource is implemented by all source registry clients (oci registries and helm repositories).
+type artifactSource interface {
+	ListTags(ctx context.Context, repository string) ([]string, error)
+	Reference(repository, tag string) string
+	CopyTo(ctx context.Context, target *registryClient, candidate SyncCandidate) error
+}
+
 func NewSyncer(cfg *Config, logger *slog.Logger) (*SyncRunner, error) {
 	if logger == nil {
 		logger = slog.Default()
@@ -67,38 +73,41 @@ func NewSyncer(cfg *Config, logger *slog.Logger) (*SyncRunner, error) {
 	}, nil
 }
 
+// Run syncs all configured images. A failure of one image or tag does not stop the sync of the others; all errors are
+// collected and returned together, and every failure is counted in SyncStats.Failed.
 func (s *SyncRunner) Run(ctx context.Context) (*SyncStats, error) {
 	stats := &SyncStats{}
 
+	var errs []error
 	for _, imageName := range sortedImageNames(s.config.Images) {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		if err := s.syncRepository(ctx, imageName, s.config.Images[imageName], stats); err != nil {
-			return stats, err
+			errs = append(errs, fmt.Errorf("images.%s: %w", imageName, err))
 		}
 	}
 
-	return stats, nil
+	return stats, errors.Join(errs...)
 }
 
 func (s *SyncRunner) syncRepository(ctx context.Context, imageName string, cfg ImageConfig, stats *SyncStats) error {
-	switch normalizeSourceType(cfg.SourceType) {
-	case SourceTypeHelmRepo:
-		return s.syncHelmRepository(ctx, imageName, cfg, stats)
-	default:
-		return s.syncOCIRepository(ctx, imageName, cfg, stats)
-	}
-}
-
-func (s *SyncRunner) syncOCIRepository(ctx context.Context, imageName string, cfg ImageConfig, stats *SyncStats) error {
-	filter, err := newTagFilter(cfg)
+	source, target, err := s.clients(cfg)
 	if err != nil {
+		stats.Failed++
 		return err
 	}
 
-	source := s.registries[cfg.SourceRegistry]
-	target := s.registries[cfg.TargetRegistry]
+	filter, err := newTagFilter(cfg)
+	if err != nil {
+		stats.Failed++
+		return err
+	}
 
 	tags, err := source.ListTags(ctx, cfg.SourceRepository)
 	if err != nil {
+		stats.Failed++
 		return fmt.Errorf("list source tags for %s from %s: %w", cfg.SourceRepository, cfg.SourceRegistry, err)
 	}
 
@@ -109,141 +118,77 @@ func (s *SyncRunner) syncOCIRepository(ctx context.Context, imageName string, cf
 	s.logger.Info(
 		"repository scan completed",
 		"image", imageName,
-		"sourceType", normalizeSourceType(cfg.SourceType),
+		"sourceType", cfg.SourceType,
 		"sourceRegistry", cfg.SourceRegistry,
 		"targetRegistry", cfg.TargetRegistry,
 		"sourceRepository", cfg.SourceRepository,
 		"targetRepository", cfg.TargetRepository,
 		"scanned", len(tags),
 		"matched", len(matchedTags),
-		"strategy", normalizePushStrategy(cfg.PushStrategy),
+		"strategy", cfg.PushStrategy,
 	)
 
+	var errs []error
 	for _, tag := range matchedTags {
-		candidate, err := s.newOCICandidate(imageName, cfg, tag)
-		if err != nil {
-			stats.Failed++
-			return err
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
 		}
 
+		candidate := newCandidate(imageName, cfg, source, target, tag)
 		copied, err := s.syncTag(ctx, source, target, candidate)
-		if err != nil {
+		switch {
+		case err != nil:
 			stats.Failed++
-			return err
-		}
-		if copied {
+			s.logger.Error("failed to sync artifact", "image", imageName, "sourceRef", candidate.SourceRef, "targetRef", candidate.TargetRef, "error", err)
+			errs = append(errs, err)
+		case copied:
 			stats.Copied++
-		} else {
+		default:
 			stats.Skipped++
 		}
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
-func (s *SyncRunner) syncHelmRepository(ctx context.Context, imageName string, cfg ImageConfig, stats *SyncStats) error {
-	filter, err := newTagFilter(cfg)
-	if err != nil {
-		return err
+// clients returns the source and target clients for an image; config validation guarantees they exist.
+func (s *SyncRunner) clients(cfg ImageConfig) (artifactSource, *registryClient, error) {
+	target, ok := s.registries[cfg.TargetRegistry]
+	if !ok {
+		return nil, nil, fmt.Errorf("target registry %q is not an oci registry", cfg.TargetRegistry)
 	}
 
-	source := s.helmRepositories[cfg.SourceRegistry]
-	target := s.registries[cfg.TargetRegistry]
-
-	versions, err := source.ListTags(ctx, cfg.SourceRepository)
-	if err != nil {
-		return fmt.Errorf("list helm chart versions for %s from %s: %w", cfg.SourceRepository, cfg.SourceRegistry, err)
-	}
-
-	stats.Scanned += len(versions)
-	matchedVersions := filterTags(versions, filter)
-	stats.Matched += len(matchedVersions)
-
-	s.logger.Info(
-		"repository scan completed",
-		"image", imageName,
-		"sourceType", normalizeSourceType(cfg.SourceType),
-		"sourceRegistry", cfg.SourceRegistry,
-		"targetRegistry", cfg.TargetRegistry,
-		"sourceRepository", cfg.SourceRepository,
-		"targetRepository", cfg.TargetRepository,
-		"scanned", len(versions),
-		"matched", len(matchedVersions),
-		"strategy", normalizePushStrategy(cfg.PushStrategy),
-	)
-
-	for _, version := range matchedVersions {
-		candidate, err := s.newHelmCandidate(imageName, cfg, version)
-		if err != nil {
-			stats.Failed++
-			return err
+	switch cfg.SourceType {
+	case SourceTypeHelmRepo:
+		if source, ok := s.helmRepositories[cfg.SourceRegistry]; ok {
+			return source, target, nil
 		}
-
-		copied, err := s.syncHelmTag(ctx, source, target, candidate)
-		if err != nil {
-			stats.Failed++
-			return err
-		}
-		if copied {
-			stats.Copied++
-		} else {
-			stats.Skipped++
+	case SourceTypeOCI:
+		if source, ok := s.registries[cfg.SourceRegistry]; ok {
+			return source, target, nil
 		}
 	}
-
-	return nil
+	return nil, nil, fmt.Errorf("source registry %q does not match source-type %q", cfg.SourceRegistry, cfg.SourceType)
 }
 
-func (s *SyncRunner) newOCICandidate(imageName string, cfg ImageConfig, tag string) (SyncCandidate, error) {
-	source := s.registries[cfg.SourceRegistry]
-	target := s.registries[cfg.TargetRegistry]
-
-	sourceRef, err := source.TagReference(cfg.SourceRepository, tag)
-	if err != nil {
-		return SyncCandidate{}, fmt.Errorf("build source ref for %s:%s: %w", cfg.SourceRepository, tag, err)
-	}
-	targetRef, err := target.TagReference(cfg.TargetRepository, tag)
-	if err != nil {
-		return SyncCandidate{}, fmt.Errorf("build target ref for %s:%s: %w", cfg.TargetRepository, tag, err)
-	}
-
-	return SyncCandidate{
+func newCandidate(imageName string, cfg ImageConfig, source artifactSource, target *registryClient, tag string) SyncCandidate {
+	candidate := SyncCandidate{
 		ImageName:        imageName,
-		SourceType:       SourceTypeOCI,
+		SourceType:       cfg.SourceType,
 		SourceRegistry:   cfg.SourceRegistry,
 		TargetRegistry:   cfg.TargetRegistry,
 		SourceRepository: cfg.SourceRepository,
 		TargetRepository: cfg.TargetRepository,
 		Tag:              tag,
-		SourceRef:        sourceRef,
-		TargetRef:        targetRef,
-		Strategy:         normalizePushStrategy(cfg.PushStrategy),
-	}, nil
-}
-
-func (s *SyncRunner) newHelmCandidate(imageName string, cfg ImageConfig, version string) (SyncCandidate, error) {
-	target := s.registries[cfg.TargetRegistry]
-	targetTag := helmChartRegistryTag(version)
-	targetRef, err := target.TagReference(cfg.TargetRepository, targetTag)
-	if err != nil {
-		return SyncCandidate{}, fmt.Errorf("build target ref for %s:%s: %w", cfg.TargetRepository, targetTag, err)
+		SourceRef:        source.Reference(cfg.SourceRepository, tag),
+		Strategy:         cfg.PushStrategy,
 	}
-
-	return SyncCandidate{
-		ImageName:        imageName,
-		SourceType:       SourceTypeHelmRepo,
-		SourceRegistry:   cfg.SourceRegistry,
-		TargetRegistry:   cfg.TargetRegistry,
-		SourceRepository: cfg.SourceRepository,
-		TargetRepository: cfg.TargetRepository,
-		Tag:              version,
-		SourceRef:        fmt.Sprintf("%s/%s:%s", cfg.SourceRegistry, cfg.SourceRepository, version),
-		TargetRef:        targetRef,
-		Strategy:         normalizePushStrategy(cfg.PushStrategy),
-	}, nil
+	candidate.TargetRef = target.Reference(cfg.TargetRepository, candidate.targetTag())
+	return candidate
 }
 
-func (s *SyncRunner) syncTag(ctx context.Context, source, target *registryClient, candidate SyncCandidate) (bool, error) {
+func (s *SyncRunner) syncTag(ctx context.Context, source artifactSource, target *registryClient, candidate SyncCandidate) (bool, error) {
 	if candidate.Strategy == PushStrategyIfNotPresent {
 		exists, err := target.TagExists(ctx, candidate.TargetRepository, candidate.targetTag())
 		if err != nil {
@@ -267,62 +212,9 @@ func (s *SyncRunner) syncTag(ctx context.Context, source, target *registryClient
 		"sourceRef", candidate.SourceRef,
 		"targetRef", candidate.TargetRef,
 	)
-	if err := s.copyReference(ctx, source, target, candidate); err != nil {
+	if err := source.CopyTo(ctx, target, candidate); err != nil {
 		return false, err
 	}
 
 	return true, nil
-}
-
-func (s *SyncRunner) syncHelmTag(ctx context.Context, source *helmRepositoryClient, target *registryClient, candidate SyncCandidate) (bool, error) {
-	if candidate.Strategy == PushStrategyIfNotPresent {
-		exists, err := target.TagExists(ctx, candidate.TargetRepository, candidate.targetTag())
-		if err != nil {
-			return false, fmt.Errorf("check target tag %s: %w", candidate.TargetRef, err)
-		}
-		if exists {
-			s.logger.Info("skipping existing artifact", "image", candidate.ImageName, "targetRef", candidate.TargetRef)
-			return false, nil
-		}
-	}
-
-	for _, checker := range s.checkers {
-		if err := checker.Check(ctx, candidate); err != nil {
-			return false, fmt.Errorf("checker %s rejected %s: %w", checker.Name(), candidate.SourceRef, err)
-		}
-	}
-
-	chartData, err := source.DownloadChart(ctx, candidate.SourceRepository, candidate.Tag)
-	if err != nil {
-		return false, fmt.Errorf("download chart %s version %s: %w", candidate.SourceRepository, candidate.Tag, err)
-	}
-
-	s.logger.Info(
-		"copying artifact",
-		"image", candidate.ImageName,
-		"sourceRef", candidate.SourceRef,
-		"targetRef", candidate.TargetRef,
-	)
-	if _, err := target.PushHelmChart(ctx, candidate.TargetRepository, chartData); err != nil {
-		return false, fmt.Errorf("push helm chart %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
-	}
-
-	return true, nil
-}
-
-func (s *SyncRunner) copyReference(ctx context.Context, source, target *registryClient, candidate SyncCandidate) error {
-	sourceRepo, err := source.ORASRepository(candidate.SourceRepository)
-	if err != nil {
-		return fmt.Errorf("build source repository for %s: %w", candidate.SourceRef, err)
-	}
-	targetRepo, err := target.ORASRepository(candidate.TargetRepository)
-	if err != nil {
-		return fmt.Errorf("build target repository for %s: %w", candidate.TargetRef, err)
-	}
-
-	if _, err := oras.Copy(ctx, sourceRepo, candidate.Tag, targetRepo, candidate.targetTag(), oras.DefaultCopyOptions); err != nil {
-		return fmt.Errorf("copy %s -> %s: %w", candidate.SourceRef, candidate.TargetRef, err)
-	}
-
-	return nil
 }

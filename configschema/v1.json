@@ -55,6 +55,11 @@
           "minLength": 1,
           "format": "uri"
         },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Username for basic auth / token exchange; the token is used as password. Without a username the token is sent as bearer token."
+        },
         "token": {
           "type": "string",
           "minLength": 1
@@ -68,7 +73,8 @@
           "minLength": 1
         },
         "insecure": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "oci: connect to the registry over plain HTTP. helm-repo: skip TLS certificate verification (HTTP vs. HTTPS is taken from the url)."
         }
       },
       "allOf": [
@@ -116,6 +122,27 @@
             ]
           }
         ]
+      },
+      "dependentSchemas": {
+        "username": {
+          "anyOf": [
+            {
+              "required": [
+                "token"
+              ]
+            },
+            {
+              "required": [
+                "token-env"
+              ]
+            },
+            {
+              "required": [
+                "token-command"
+              ]
+            }
+          ]
+        }
       }
     },
     "imageConfig": {
